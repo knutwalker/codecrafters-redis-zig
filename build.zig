@@ -30,4 +30,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    const check_exe = b.addExecutable(.{
+        .name = "zig",
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.resolveTargetQuery(.{}),
+        .optimize = .Debug,
+    });
+    const check_step = b.step("check", "Check if the project compiles");
+    check_step.dependOn(&check_exe.step);
 }
