@@ -10,6 +10,7 @@ pub fn main() !void {
         const connection = try listener.accept();
 
         log.debug("accepted new connection from {}", .{connection.address});
+        try connection.stream.writeAll("+PONG\r\n");
         connection.stream.close();
     }
 }
