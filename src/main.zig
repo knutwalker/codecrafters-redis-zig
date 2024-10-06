@@ -10,11 +10,14 @@ pub fn main() !void {
     });
     defer listener.deinit();
 
+    var store = Store.init(alloc.allocator());
+    defer store.deinit();
+
     var pool: thread.Pool = undefined;
     try pool.init(.{ .allocator = alloc.allocator() });
     defer pool.deinit();
 
-    var server = try thread.spawn(.{}, mainServer, .{ listener, &pool, alloc.allocator() });
+    var server = try thread.spawn(.{}, mainServer, .{ listener, &pool, .{ alloc.allocator(), &store } });
     server.detach();
 
     running.wait();
@@ -42,17 +45,20 @@ fn acceptConnection(connection: net.Server.Connection, ctx: anytype) void {
     connection.stream.close();
 }
 
-fn handleConnection(ctx: Alloc, connection: net.Stream) !void {
+fn handleConnection(ctx: anytype, connection: net.Stream) !void {
+    const alloc = ctx[0];
+    const store = ctx[1];
+
     var parser = Parser.init(connection);
 
-    while (try parser.next(ctx)) |value| {
+    while (try parser.next(alloc)) |value| {
         defer value.deinit();
         log.debug("Request RESP: {}", .{value});
 
-        const command = try Command.parse(ctx, &value.data);
+        const command = try Command.parse(alloc, &value.data);
         log.info("Request: {}", .{command});
 
-        const response = try handleCommand(ctx, command) orelse continue;
+        const response = try command.handle(store) orelse continue;
         log.info("Response: {}", .{response});
         defer response.deinit();
 
@@ -61,25 +67,13 @@ fn handleConnection(ctx: Alloc, connection: net.Stream) !void {
     }
 }
 
-fn handleCommand(ctx: Alloc, command: Command) !?Value {
-    _ = ctx;
-    switch (command) {
-        .ping => return .{ .data = .{ .string = .{ .data = "PONG" } } },
-        .shutdown => {
-            running.set();
-            return .{ .data = .{ .string = .{ .data = "OK" } } };
-        },
-        .echo => |message| {
-            return .{ .data = message };
-        },
-    }
-}
-
 // Commands {{{
 const Command = union(enum) {
     ping,
     shutdown,
-    echo: Resp,
+    echo: *const Resp,
+    get: []const u8,
+    set: [2][]const u8,
 
     const CommandError = error{
         ExpectNonEmptyArray,
@@ -96,21 +90,93 @@ const Command = union(enum) {
                 const command = arr.items[0];
                 const cmd_string = command.asStr() orelse return CommandError.ExpectString;
 
-                inline for (.{ "ping", "shutdown" }) |field| {
-                    if (ascii.eqlIgnoreCase(field, cmd_string)) {
-                        return @field(Command, field);
+                inline for (.{ "ping", "shutdown" }) |cmd| {
+                    if (ascii.eqlIgnoreCase(cmd_string, cmd)) {
+                        return @field(Command, cmd);
                     }
                 }
 
-                if (ascii.eqlIgnoreCase("echo", cmd_string)) {
+                if (ascii.eqlIgnoreCase(cmd_string, "echo")) {
                     if (arr.items.len < 2) return CommandError.MissingArgument;
-                    return .{ .echo = arr.items[1] };
+                    return .{ .echo = &arr.items[1] };
+                }
+
+                if (ascii.eqlIgnoreCase(cmd_string, "get")) {
+                    if (arr.items.len < 2) return CommandError.MissingArgument;
+                    const arg = arr.items[1].asStr() orelse return CommandError.ExpectString;
+                    return .{ .get = arg };
+                }
+
+                if (ascii.eqlIgnoreCase(cmd_string, "set")) {
+                    if (arr.items.len < 3) return CommandError.MissingArgument;
+                    const key = arr.items[1].asStr() orelse return CommandError.ExpectString;
+                    const value = arr.items[2].asStr() orelse return CommandError.ExpectString;
+                    return .{ .set = .{ key, value } };
                 }
 
                 return CommandError.InvalidCommand;
             },
             else => return CommandError.ExpectNonEmptyArray,
         }
+    }
+
+    fn handle(command: Command, store: *Store) !?Value {
+        switch (command) {
+            .ping => return .{ .data = .{ .string = .{ .data = "PONG" } } },
+            .shutdown => {
+                running.set();
+                return .{ .data = .{ .string = .{ .data = "OK" } } };
+            },
+            .echo => |message| {
+                return .{ .data = message.* };
+            },
+            .get => |key| {
+                if (store.get(key)) |val| {
+                    return .{ .data = .{ .bulk_str = .{ .data = val } } };
+                } else {
+                    return .{ .data = .null };
+                }
+            },
+            .set => |kv| {
+                try store.set(kv[0], kv[1]);
+                return .{ .data = .{ .string = .{ .data = "OK" } } };
+            },
+        }
+    }
+};
+
+const Store = struct {
+    const Map = std.StringHashMapUnmanaged([]const u8);
+    data: Map = .{},
+    mutex: thread.Mutex = .{},
+    alloc: Alloc,
+
+    fn init(alloc: Alloc) @This() {
+        return .{ .alloc = alloc };
+    }
+
+    fn set(self: *Store, key: []const u8, value: []const u8) !void {
+        const own_key = try self.alloc.dupe(u8, key);
+        const own_value = try self.alloc.dupe(u8, value);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.data.put(self.alloc, own_key, own_value);
+    }
+
+    fn get(self: *Store, key: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.data.get(key);
+    }
+
+    fn deinit(self: *@This()) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.data.deinit(self.alloc);
     }
 };
 
