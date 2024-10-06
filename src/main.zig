@@ -69,6 +69,9 @@ fn handleCommand(ctx: Alloc, command: Command) !?Value {
             running.set();
             return .{ .data = .{ .string = .{ .data = "OK" } } };
         },
+        .echo => |message| {
+            return .{ .data = message };
+        },
     }
 }
 
@@ -76,11 +79,13 @@ fn handleCommand(ctx: Alloc, command: Command) !?Value {
 const Command = union(enum) {
     ping,
     shutdown,
+    echo: Resp,
 
     const CommandError = error{
         ExpectNonEmptyArray,
         ExpectString,
         InvalidCommand,
+        MissingArgument,
     };
 
     fn parse(alloc: Alloc, data: *const Resp) CommandError!Command {
@@ -91,10 +96,15 @@ const Command = union(enum) {
                 const command = arr.items[0];
                 const cmd_string = command.asStr() orelse return CommandError.ExpectString;
 
-                inline for (std.meta.fields(Command)) |field| {
-                    if (ascii.eqlIgnoreCase(field.name, cmd_string)) {
-                        return @field(Command, field.name ++ "");
+                inline for (.{ "ping", "shutdown" }) |field| {
+                    if (ascii.eqlIgnoreCase(field, cmd_string)) {
+                        return @field(Command, field);
                     }
+                }
+
+                if (ascii.eqlIgnoreCase("echo", cmd_string)) {
+                    if (arr.items.len < 2) return CommandError.MissingArgument;
+                    return .{ .echo = arr.items[1] };
                 }
 
                 return CommandError.InvalidCommand;
