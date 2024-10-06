@@ -328,10 +328,15 @@ const Resp = union(Tag) {
         try writer.flush();
     }
 
+    const write_resp3_null = false;
     fn innerWrite(self: *const Self, writer: *DefaultWriter) !void {
         switch (self.*) {
             .null => {
-                try writer.append("_\r\n");
+                if (write_resp3_null) {
+                    try writer.append("_\r\n");
+                } else {
+                    try writer.append("$-1\r\n");
+                }
             },
             .bool => |b| {
                 try writer.append("#");
