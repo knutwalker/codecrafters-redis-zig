@@ -46,7 +46,7 @@ fn handleConnection(ctx: Alloc, connection: net.Stream) !void {
     var parser = Parser.init(connection);
 
     while (try parser.next(ctx)) |value| {
-        defer value.data.deinit(ctx);
+        defer value.deinit();
         log.debug("Request RESP: {}", .{value});
 
         const command = try Command.parse(ctx, &value.data);
@@ -54,24 +54,22 @@ fn handleConnection(ctx: Alloc, connection: net.Stream) !void {
 
         const response = try handleCommand(ctx, command) orelse continue;
         log.info("Response: {}", .{response});
+        defer response.deinit();
 
-        const result = try response.render();
-        defer result.deinit(ctx);
-        log.debug("Response RESP: {}", .{result});
-        try result.writeTo(connection);
+        log.debug("Response RESP: {}", .{response});
+        try response.data.writeTo(connection);
     }
 }
 
-fn handleCommand(ctx: Alloc, command: Command) !?Response {
+fn handleCommand(ctx: Alloc, command: Command) !?Value {
     _ = ctx;
-    const response = switch (command) {
-        .ping => Response{ .pong = {} },
+    switch (command) {
+        .ping => return .{ .data = .{ .string = .{ .data = "PONG" } } },
         .shutdown => {
             running.set();
-            return .{ .ok = {} };
+            return .{ .data = .{ .string = .{ .data = "OK" } } };
         },
-    };
-    return response;
+    }
 }
 
 // Commands {{{
@@ -106,22 +104,6 @@ const Command = union(enum) {
     }
 };
 
-// }}}
-
-// Responses {{{
-const Response = union(enum) {
-    pong,
-    ok,
-
-    const ResponseError = error{};
-
-    fn render(self: Response) ResponseError!SendResp {
-        switch (self) {
-            .pong => return .{ .string = .{ .data = "PONG" } },
-            .ok => return .{ .string = .{ .data = "OK" } },
-        }
-    }
-};
 // }}}
 
 // RESP {{{
@@ -168,165 +150,166 @@ const Simple = union(enum) {
     }
 };
 
-const Resp = GenericResp(true);
-const SendResp = GenericResp(false);
+const Resp = union(Tag) {
+    null,
+    bool: bool,
+    int: i64,
+    double: f64,
+    bignum: i128,
+    string: Str,
+    bulk_str: Str,
+    verbatim: Str,
+    err: Str,
+    bulk_err: Str,
+    array: List,
+    map: Dict,
+    attribute: Dict,
+    set: Set,
+    push: List,
 
-fn GenericResp(comptime managed: bool) type {
-    return union(Tag) {
-        null,
-        bool: bool,
-        int: i64,
-        double: f64,
-        bignum: i128,
-        string: Str,
-        bulk_str: Str,
-        verbatim: Str,
-        err: Str,
-        bulk_err: Str,
-        array: List,
-        map: Dict,
-        attribute: Dict,
-        set: Set,
-        push: List,
+    const Self = @This();
 
-        const Self = @This();
-
-        const Str = struct {
-            data: []const u8,
-            encoding: ?[3]u8 = null,
-        };
-
-        const List = struct {
-            items: []const Self,
-        };
-
-        const Dict = struct { items: []const Self };
-
-        const Set = struct { items: []const Self };
-
-        fn simple(self: *const Self) ?Simple {
-            return switch (self.*) {
-                inline .bool => |b| .{ .bool = b },
-                inline .int => |int| .{ .int = int },
-                inline .double => |double| .{ .double = double },
-                inline .bignum => |bignum| .{ .bignum = bignum },
-                inline .string, .bulk_str, .verbatim => |string| .{ .string = string.data },
-                inline .err, .bulk_err => |err| .{ .err = err.data },
-                else => null,
-            };
-        }
-
-        fn asStr(self: Self) ?[]const u8 {
-            const as_simple = self.simple() orelse return null;
-            return as_simple.str();
-        }
-
-        fn writeTo(self: *const SendResp, stream: net.Stream) !void {
-            var writer = DefaultWriter.init(stream);
-            try self.innerWrite(&writer);
-            try writer.flush();
-        }
-
-        fn innerWrite(self: *const SendResp, writer: *DefaultWriter) !void {
-            switch (self.*) {
-                .null => {
-                    try writer.append("_\r\n");
-                },
-                .bool => |b| {
-                    try writer.append("#");
-                    try writer.append(if (b) "t" else "f");
-                    try writer.append("\r\n");
-                },
-                .int => |int| {
-                    try writer.print(":{d}\r\n", .{int});
-                },
-                .double => |double| {
-                    try writer.print(",{d}\r\n", .{double});
-                },
-                .bignum => |bignum| {
-                    try writer.print("({d}\r\n", .{bignum});
-                },
-                .string => |string| {
-                    try writer.append("+");
-                    try writer.append(string.data);
-                    try writer.append("\r\n");
-                },
-                .err => |err| {
-                    try writer.append("-");
-                    try writer.append(err.data);
-                    try writer.append("\r\n");
-                },
-                .bulk_str => |bulk_str| {
-                    try writer.print("${d}\r\n", .{bulk_str.data.len});
-                    try writer.append(bulk_str.data);
-                    try writer.append("\r\n");
-                },
-                .array => |array| {
-                    try writer.print("*{d}\r\n", .{array.items.len});
-                    for (array.items) |item| {
-                        try item.innerWrite(writer);
-                    }
-                },
-                .bulk_err => |bulk_err| {
-                    try writer.print("!{d}\r\n", .{bulk_err.data.len});
-                    try writer.append(bulk_err.data);
-                    try writer.append("\r\n");
-                },
-                .verbatim => |verbatim| {
-                    try writer.print("={d}\r\n", .{verbatim.data.len});
-                    try writer.append(verbatim.encoding.?[0..]);
-                    try writer.append(":");
-                    try writer.append(verbatim.data);
-                    try writer.append("\r\n");
-                },
-                .map => |map| {
-                    try writer.print("%{d}\r\n", .{map.items.len / 2});
-                    for (map.items) |item| {
-                        try item.innerWrite(writer);
-                    }
-                },
-                .attribute => |attribute| {
-                    try writer.print("|{d}\r\n", .{attribute.items.len / 2});
-                    for (attribute.items) |item| {
-                        try item.innerWrite(writer);
-                    }
-                },
-                .set => |set| {
-                    try writer.print("~{d}\r\n", .{set.items.len});
-                    for (set.items) |item| {
-                        try item.innerWrite(writer);
-                    }
-                },
-                .push => |push| {
-                    try writer.print(">{d}\r\n", .{push.items.len});
-                    for (push.items) |item| {
-                        try item.innerWrite(writer);
-                    }
-                },
-            }
-        }
-
-        fn deinit(self: Self, alloc: Alloc) void {
-            if (!managed) return;
-            switch (self) {
-                .string, .bulk_str, .verbatim, .err, .bulk_err => |str| {
-                    alloc.free(str.data);
-                },
-                inline .array, .map, .attribute, .set, .push => |list| {
-                    for (list.items) |item| {
-                        item.deinit(alloc);
-                    }
-                    alloc.free(list.items);
-                },
-                else => {},
-            }
-        }
+    const Str = struct {
+        data: []const u8,
+        encoding: ?[3]u8 = null,
     };
-}
+
+    const List = struct {
+        items: []const Self,
+    };
+
+    const Dict = struct { items: []const Self };
+
+    const Set = struct { items: []const Self };
+
+    fn simple(self: *const Self) ?Simple {
+        return switch (self.*) {
+            inline .bool => |b| .{ .bool = b },
+            inline .int => |int| .{ .int = int },
+            inline .double => |double| .{ .double = double },
+            inline .bignum => |bignum| .{ .bignum = bignum },
+            inline .string, .bulk_str, .verbatim => |string| .{ .string = string.data },
+            inline .err, .bulk_err => |err| .{ .err = err.data },
+            else => null,
+        };
+    }
+
+    fn asStr(self: Self) ?[]const u8 {
+        const as_simple = self.simple() orelse return null;
+        return as_simple.str();
+    }
+
+    fn writeTo(self: *const Self, stream: net.Stream) !void {
+        var writer = DefaultWriter.init(stream);
+        try self.innerWrite(&writer);
+        try writer.flush();
+    }
+
+    fn innerWrite(self: *const Self, writer: *DefaultWriter) !void {
+        switch (self.*) {
+            .null => {
+                try writer.append("_\r\n");
+            },
+            .bool => |b| {
+                try writer.append("#");
+                try writer.append(if (b) "t" else "f");
+                try writer.append("\r\n");
+            },
+            .int => |int| {
+                try writer.print(":{d}\r\n", .{int});
+            },
+            .double => |double| {
+                try writer.print(",{d}\r\n", .{double});
+            },
+            .bignum => |bignum| {
+                try writer.print("({d}\r\n", .{bignum});
+            },
+            .string => |string| {
+                try writer.append("+");
+                try writer.append(string.data);
+                try writer.append("\r\n");
+            },
+            .err => |err| {
+                try writer.append("-");
+                try writer.append(err.data);
+                try writer.append("\r\n");
+            },
+            .bulk_str => |bulk_str| {
+                try writer.print("${d}\r\n", .{bulk_str.data.len});
+                try writer.append(bulk_str.data);
+                try writer.append("\r\n");
+            },
+            .array => |array| {
+                try writer.print("*{d}\r\n", .{array.items.len});
+                for (array.items) |item| {
+                    try item.innerWrite(writer);
+                }
+            },
+            .bulk_err => |bulk_err| {
+                try writer.print("!{d}\r\n", .{bulk_err.data.len});
+                try writer.append(bulk_err.data);
+                try writer.append("\r\n");
+            },
+            .verbatim => |verbatim| {
+                try writer.print("={d}\r\n", .{verbatim.data.len});
+                try writer.append(verbatim.encoding.?[0..]);
+                try writer.append(":");
+                try writer.append(verbatim.data);
+                try writer.append("\r\n");
+            },
+            .map => |map| {
+                try writer.print("%{d}\r\n", .{map.items.len / 2});
+                for (map.items) |item| {
+                    try item.innerWrite(writer);
+                }
+            },
+            .attribute => |attribute| {
+                try writer.print("|{d}\r\n", .{attribute.items.len / 2});
+                for (attribute.items) |item| {
+                    try item.innerWrite(writer);
+                }
+            },
+            .set => |set| {
+                try writer.print("~{d}\r\n", .{set.items.len});
+                for (set.items) |item| {
+                    try item.innerWrite(writer);
+                }
+            },
+            .push => |push| {
+                try writer.print(">{d}\r\n", .{push.items.len});
+                for (push.items) |item| {
+                    try item.innerWrite(writer);
+                }
+            },
+        }
+    }
+
+    fn deinit(self: Self, alloc: Alloc) void {
+        switch (self) {
+            .string, .bulk_str, .verbatim, .err, .bulk_err => |str| {
+                alloc.free(str.data);
+            },
+            inline .array, .map, .attribute, .set, .push => |list| {
+                for (list.items) |item| {
+                    item.deinit(alloc);
+                }
+                alloc.free(list.items);
+            },
+            else => {},
+        }
+    }
+};
 
 const Value = struct {
     data: Resp,
     attr: ?Resp.Dict = null,
+    alloc: ?Alloc = null,
+
+    fn deinit(self: @This()) void {
+        if (self.alloc) |alloc| {
+            self.data.deinit(alloc);
+        }
+    }
 };
 
 // Parser {{{
@@ -348,7 +331,7 @@ const Parser = struct {
 
     fn parseNext(self: *@This(), alloc: Alloc, tag_byte: u8) ParseError!Value {
         _ = std.meta.intToEnum(Tag, tag_byte) catch return self.parseInline(alloc, tag_byte);
-        return .{ .data = try parsers[tag_byte].parse(alloc, self) };
+        return .{ .data = try parsers[tag_byte].parse(alloc, self), .alloc = alloc };
     }
 
     fn parseInline(self: *@This(), alloc: Alloc, tag_byte: u8) ParseError!Value {
@@ -366,7 +349,7 @@ const Parser = struct {
             try items.append(alloc, value);
         }
 
-        return .{ .data = .{ .array = .{ .items = try items.toOwnedSlice(alloc) } } };
+        return .{ .data = .{ .array = .{ .items = try items.toOwnedSlice(alloc) } }, .alloc = alloc };
     }
 
     const DataError = error{
