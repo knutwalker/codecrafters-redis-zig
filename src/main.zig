@@ -73,13 +73,17 @@ const Command = union(enum) {
     shutdown,
     echo: *const Resp,
     get: []const u8,
-    set: [2][]const u8,
+    set: Set,
+
+    const Set = struct { key: []const u8, value: []const u8, expired_after: ?i64 = null };
 
     const CommandError = error{
         ExpectNonEmptyArray,
         ExpectString,
+        ExpectInt,
         InvalidCommand,
         MissingArgument,
+        InvalidArgument,
     };
 
     fn parse(alloc: Alloc, data: *const Resp) CommandError!Command {
@@ -111,7 +115,18 @@ const Command = union(enum) {
                     if (arr.items.len < 3) return CommandError.MissingArgument;
                     const key = arr.items[1].asStr() orelse return CommandError.ExpectString;
                     const value = arr.items[2].asStr() orelse return CommandError.ExpectString;
-                    return .{ .set = .{ key, value } };
+
+                    if (arr.items.len >= 5) {
+                        const scale_str = arr.items[3].asStr() orelse return CommandError.ExpectString;
+                        const to_ms: i64 = if (ascii.eqlIgnoreCase(scale_str, "px")) 1 else if (ascii.eqlIgnoreCase(scale_str, "ex")) time.ms_per_s else return CommandError.InvalidArgument;
+                        const expiry = arr.items[4].asInt(i64) orelse return CommandError.ExpectInt;
+                        const expiry_ms = expiry * to_ms;
+                        const now = time.milliTimestamp();
+                        const expired_after = now +| expiry_ms;
+                        return .{ .set = .{ .key = key, .value = value, .expired_after = expired_after } };
+                    }
+
+                    return .{ .set = .{ .key = key, .value = value } };
                 }
 
                 return CommandError.InvalidCommand;
@@ -137,8 +152,8 @@ const Command = union(enum) {
                     return .{ .data = .null };
                 }
             },
-            .set => |kv| {
-                try store.set(kv[0], kv[1]);
+            .set => |set| {
+                try store.set(set.key, set.value, set.expired_after);
                 return .{ .data = .{ .string = .{ .data = "OK" } } };
             },
         }
@@ -146,7 +161,9 @@ const Command = union(enum) {
 };
 
 const Store = struct {
-    const Map = std.StringHashMapUnmanaged([]const u8);
+    const Map = std.StringHashMapUnmanaged(Store.Value);
+    const Value = struct { val: []const u8, expired_after: ?i64 = null };
+
     data: Map = .{},
     mutex: thread.Mutex = .{},
     alloc: Alloc,
@@ -155,21 +172,39 @@ const Store = struct {
         return .{ .alloc = alloc };
     }
 
-    fn set(self: *Store, key: []const u8, value: []const u8) !void {
+    fn set(self: *Store, key: []const u8, value: []const u8, expired_after: ?i64) !void {
         const own_key = try self.alloc.dupe(u8, key);
         const own_value = try self.alloc.dupe(u8, value);
+        const full_value = Store.Value{ .val = own_value, .expired_after = expired_after };
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.data.put(self.alloc, own_key, own_value);
+        try self.data.put(self.alloc, own_key, full_value);
     }
 
     fn get(self: *Store, key: []const u8) ?[]const u8 {
+        const val = b: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :b self.data.get(key);
+        } orelse return null;
+
+        if (val.expired_after) |expired_after| {
+            if (time.milliTimestamp() >= expired_after) {
+                _ = self.del(key);
+                return null;
+            }
+        }
+
+        return val.val;
+    }
+
+    fn del(self: *Store, key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        return self.data.get(key);
+        return self.data.remove(key);
     }
 
     fn deinit(self: *@This()) void {
@@ -273,6 +308,18 @@ const Resp = union(Tag) {
     fn asStr(self: Self) ?[]const u8 {
         const as_simple = self.simple() orelse return null;
         return as_simple.str();
+    }
+
+    fn asInt(self: Self, comptime T: type) ?T {
+        const as_simple = self.simple() orelse return null;
+        return switch (as_simple) {
+            .bool => |b| @intFromBool(b),
+            .int => |int| @intCast(int),
+            .double => |double| @intFromFloat(double),
+            .bignum => |bignum| @intCast(bignum),
+            .string => |string| std.fmt.parseInt(T, string, 10) catch null,
+            else => null,
+        };
     }
 
     fn writeTo(self: *const Self, stream: net.Stream) !void {
@@ -787,6 +834,7 @@ const log = std.log.scoped(.redis);
 const mem = std.mem;
 const net = std.net;
 const thread = std.Thread;
+const time = std.time;
 const vec = std.posix.iovec_const;
 
 pub const std_options = .{
